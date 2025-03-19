@@ -10,6 +10,8 @@ import openai
 from openai import OpenAI
 from pinecone import Pinecone
 import time
+from datetime import datetime
+import dateparser
 
 ############################################
 # Configuration & Initialization
@@ -127,6 +129,7 @@ class QueryAgent:
     def __init__(self, pinecone_index, openai_client):
         self.pinecone_index = pinecone_index
         self.openai_client = openai_client
+        self.top_k = 5
         
     def preprocess_text(self, text):
         # Remove punctuation and newlines for consistency.
@@ -149,40 +152,127 @@ class QueryAgent:
         """Generates embeddings for text"""
         return self.openai_client.embeddings.create(input=[text], model=model).data[0].embedding
 
-    def store_data(self, query):
-        # Extract key details from the input for storing
-        prompt = f"Extract the key details from this input for storing in a pinecone vector: {query}"
+    def extract_key_details(self, query):
+        
+        # Get today's date
+        today = datetime.now()
+        """Use OpenAI to extract key features (task, time, category)."""
+        prompt = f"""
+        Extract structured key details from the following reminder or event request.
+        Output should be in JSON format with the following fields: 
+        - "type": Category of task (e.g., "Reminder - Groceries", "Meeting", "Appointment").
+        - "task": The actual task description.
+        - "time": Extracted date and time in MM/DD/YY HH:mm AM/PM format.
+        
+        Example:
+        Input: "Remind me to buy tomatoes tomorrow at 10 pm."
+        Output: {{
+            "type": "Reminder - Groceries",
+            "task": "Buying tomatoes",
+            "time": "03/14/25 10:00 PM"
+        }}
+        This is todays date:"{today}"\n
+        Now process this input:
+        "{query}"
+        """
+        
         response = self.openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}]
         )
+
+        try:
+            extracted_data = json.loads(response.choices[0].message.content)
+            return extracted_data
+        except json.JSONDecodeError:
+            return {"type": "Unknown", "task": query, "time": "Unknown"}
+
+    def parse_time(self, text):
+        """Convert relative time expressions into actual dates."""
+        parsed_date = dateparser.parse(text, settings={'PREFER_DATES_FROM': 'future'})
+        if parsed_date:
+            return parsed_date.strftime("%m/%d/%y %I:%M %p")  # Format MM/DD/YY HH:MM AM/PM
+        return "Unknown"
+    
+    def store_data(self, query):
+        """Extract, format, and store structured data into Pinecone."""
+        extracted_data = self.extract_key_details(query)
+
+        # Convert relative times like "tomorrow" into actual dates
+        extracted_data["time"] = self.parse_time(extracted_data["time"])
+
+        print(f"📝 Storing: {extracted_data}")
         
-        # Extract the text from the response object
-        extracted_text = response.choices[0].message.content
+        # Convert extracted_data dictionary to a string format
+        formatted_text = f"{extracted_data['type']}: {extracted_data['task']} at {extracted_data['time']}"
         
-        print("Extracted key for storing:", extracted_text)
+        formatted_text = self.preprocess_text(formatted_text)
+        print("Extracted key for storing:", formatted_text)
         # Preprocess and generate embedding
-        extracted_text = self.preprocess_text(extracted_text)
-        vector = self.get_embedding(extracted_text)
+        
+        vector = self.get_embedding(formatted_text)
         new_id = self.get_last_vector_id() + 1
         row_dict = {
             "id": f"vec{new_id}",
             "values": vector,
-            "metadata": {"text": extracted_text}
+            "metadata": {"text": formatted_text}
         }
         self.update_last_vector_id(new_id)
         self.pinecone_index.upsert(vectors=[row_dict])
         return "Stored successfully."
 
+    def extract_keywords(self, query):
+        """Generate keywords from a query for better search in Pinecone."""
+        prompt = f"""
+        Extract 3-5 relevant keywords from the following request to improve searchability.
+        Example:
+        Input: "What groceries do I need to buy tomorrow?"
+        Output: ["groceries", "buy", "tomorrow"]
+        
+        Now process this input:
+        "{query}"
+        """
+        
+        response = self.openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        keywords = response.choices[0].message.content.strip().split(", ")
+        return keywords
+    
+    def extract_action(self, response, query = None):
+        # Extract the action from the response
+        # Extracting the text/chunks data
+        extracted_text = ""
+        for match in response['matches'][:self.top_k]:
+            extracted_text += match['metadata']['text'] + "\n"
+        
+        return extracted_text # best result text
+    
     def retrieve_data(self, query):
+        
+        keywords = self.extract_keywords(query)
+        
+        print(f"🔍 Searching for: {keywords}")
+        
+        formatted_text = ""
+        for keyword in keywords:
+            formatted_text += keyword
+            
+        formatted_text = self.preprocess_text(formatted_text)
         # Generate an embedding for the query and search Pinecone
-        query_vector = self.get_embedding(query)
-        response = self.pinecone_index.query(vector=query_vector, top_k=3, include_metadata=True)
-        matches = response.get("matches", [])
+        
+        query_vector = self.get_embedding(formatted_text)
+
+        response = self.pinecone_index.query(vector=query_vector, top_k=self.top_k, include_metadata=True)
+        matches = self.extract_action(response)
+        
+        print(f"🔍 Pinecone response: {matches}")
         if matches:
-            return matches[0]["metadata"]["text"]
+            return matches
         else:
-            return "No data found."
+            return "No matching data found."
 
 class AnsweringAgent:
     def __init__(self, openai_client):
@@ -190,7 +280,9 @@ class AnsweringAgent:
         
     def generate_response(self, query):
         # Generate a response for general queries
-        prompt = f"""You are an AI Personal Assistant. Your task is to respond to the user's query as an AI personal Assistant would.
+        prompt = f"""You are an AI Personal Assistant. Your task is to respond to the user's query as an AI personal Assistant would.\n
+        - Keep the responses Short and Crisp.\n
+        - Respone in a happy tone with a touch of a human\n
         Here is the user's query:{query}"""
         
         response = self.openai_client.chat.completions.create(
@@ -198,16 +290,29 @@ class AnsweringAgent:
                 messages=[{"role": "assistant", "content": prompt}]
             )
         return response.choices[0].message.content
+    
+    def generate_response_from_pinecone(self, query, response):
+        # Generate a response for pine cone response
+        prompt = f"""You are an AI Personal Assistant. Your task is to respond to the user's query as an AI personal Assistant would.\n
+        - Keep the responses Short and Crisp.\n
+        - Respone in a happy tone with a touch of a human\n
+        Below is the query from the user : {query} ]\n
+        This is the reponses from the pine cone vector : {response} \name
+        
+        Compose your answer based "ONLY" on the reponses from the pine cone vector"""
+        
+        response = self.openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "assistant", "content": prompt}]
+            )
+        
+        return response.choices[0].message.content
 
 
 # Initialize our agents
 intent_agent = IntentDetectionAgent(openai_client)
 query_agent = QueryAgent(pinecone_index, openai_client)
 answering_agent = AnsweringAgent(openai_client)
-
-############################################
-# Audio Processing & TTS (from testChatIO.py)
-############################################
 
 # Initialize Vosk model for real-time speech recognition
 vosk_model = vosk.Model(VOSK_MODEL_PATH)
@@ -244,7 +349,7 @@ def process_query(user_text):
     elif intent == "Personal Data Store":
         return query_agent.store_data(user_text)
     elif intent == "Personal Data Retrieve":
-        return query_agent.retrieve_data(user_text)
+        return answering_agent.generate_response_from_pinecone(user_text,query_agent.retrieve_data(user_text))
     elif intent == "General Query":
         return answering_agent.generate_response(user_text)
     else:
