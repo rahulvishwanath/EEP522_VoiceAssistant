@@ -31,7 +31,6 @@ EEP522_VoiceAssistant/
 │    ├── testAudio.py         # Tests audio input/output
 │    ├── testChatIO.py        # Tests chatbot integration
 │    ├── testChatbot.py       # Standalone chatbot implementation
-│    ├── testWhisperInput.py  # Tests Whisper-based STT (alternative)
 │    ├── testvosk.py          # Tests Vosk STT
 │
 │── personalAssistant.py   # Main script for running the AI assistant
@@ -84,10 +83,6 @@ You can test each component separately using the scripts in the `testScripts/` f
 - **Test STT (Vosk):**
   ```bash
   python3 testvosk.py
-  ```
-- **Test Whisper STT (Optional):**
-  ```bash
-  python3 testWhisperInput.py
   ```
 
 ---
